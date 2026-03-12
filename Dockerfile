@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # ============================================================
 # IndexTTS2 Docker 镜像 — 最终确定版
 # 策略：
@@ -24,8 +23,7 @@ COPY indextts-src/ /app/
 
 # ── 3. PyTorch CUDA 三件套（官方 cu128 索引）───────────────────
 # 已缓存，重建秒过
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --timeout=600 --retries=5 \
+RUN pip install --timeout=600 --retries=5 \
         "torch==2.8.*" "torchaudio==2.8.*" "torchvision==0.23.*" \
         --index-url https://download.pytorch.org/whl/cu128 && \
     python -c "import torch; print(f'torch {torch.__version__}, CUDA={torch.cuda.is_available()}')"
@@ -33,8 +31,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ── 4. 安装 indextts 全部依赖（从阿里云 PyPI）─────────────────
 # 直接列出 pyproject.toml 中的 dependencies，跳过 torch/torchaudio
 # 这样不需要 hatchling，也不会覆盖 CUDA 版 torch
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --timeout=600 --retries=5 \
+RUN pip install --timeout=600 --retries=5 \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
         "accelerate==1.8.1" \
         "cn2an==0.5.22" \
@@ -71,8 +68,7 @@ import torchvision; print(f'torchvision {torchvision.__version__}'); \
 print('=== ALL CORE DEPS OK ===')"
 
 # ── 5. API 服务依赖 ──────────────────────────────────────────
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --timeout=600 \
+RUN pip install --timeout=600 \
         fastapi "uvicorn[standard]" python-multipart aiofiles \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 
