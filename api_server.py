@@ -326,25 +326,27 @@ async def health():
 
 # ── 任务状态接口 ─────────────────────────────────────────────────────────────
 @app.get("/tasks", tags=["任务管理"], summary="查看所有任务状态")
-async def get_tasks():
+async def get_tasks(x_api_key: str = Header(None)):
     """
-    返回当前待处理任务、处理中任务和历史记录。（无需认证）
+    返回当前待处理任务、处理中任务和历史记录。
 
     - **pending**: 排队等待的任务
     - **processing**: 正在 GPU 推理的任务（含进度百分比）
     - **history**: 已完成/失败的历史任务（最近 100 条）
     - **stats**: 统计汇总
     """
+    verify_key(x_api_key)
     return await task_manager.get_status()
 
 
 @app.get("/tasks/{task_id}", tags=["任务管理"], summary="查询单个任务进度")
-async def get_task_progress(task_id: str):
+async def get_task_progress(task_id: str, x_api_key: str = Header(None)):
     """
-    查询指定任务的当前状态和进度。（无需认证）
+    查询指定任务的当前状态和进度。
 
     返回 progress (0.0~1.0) 和 progress_msg 字段。
     """
+    verify_key(x_api_key)
     task = await task_manager.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
@@ -485,7 +487,6 @@ async def synthesize(
             "interval_silence": interval_silence,
             "repetition_penalty": repetition_penalty,
             "max_text_tokens_per_segment": max_text_tokens_per_segment,
-            "speech_speed": speech_speed,
         }
         if use_emo_text:
             kwargs["use_emo_text"] = True
@@ -603,7 +604,6 @@ async def synthesize_json(
         cache_key = get_cache_key(text, voice_name, temperature, top_p, top_k,
                                   interval_silence=interval_silence,
                                   repetition_penalty=repetition_penalty,
-                                  speech_speed=speech_speed,
                                   use_emo_text=use_emo_text,
                                   emo_text=emo_text or "")
         cache_ext = "mp3" if output_format == "mp3" else "wav"
@@ -649,7 +649,6 @@ async def synthesize_json(
             "interval_silence": interval_silence,
             "repetition_penalty": repetition_penalty,
             "max_text_tokens_per_segment": max_text_tokens_per_segment,
-            "speech_speed": speech_speed,
         }
         if use_emo_text:
             infer_kwargs["use_emo_text"] = True
@@ -759,7 +758,6 @@ async def synthesize_stream(
         "text": text,
         "output_path": stream_output_path,
         "stream_return": True,
-        "speech_speed": speech_speed,
     }
     if use_emo_text:
         infer_kwargs["use_emo_text"] = True
