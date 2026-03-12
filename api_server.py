@@ -83,10 +83,18 @@ class Task:
     top_k: int = 30
     progress: float = 0.0
     progress_msg: str = ""
+    # 异步任务结果（内部字段）
+    result_path: Optional[str] = None
+    result_format: Optional[str] = None
+    result_duration: Optional[float] = None
+    result_sample_rate: int = 22050
 
     def to_dict(self):
         d = asdict(self)
         d["status"] = self.status.value
+        # 移除内部字段
+        for internal in ("result_path", "result_format", "result_duration", "result_sample_rate"):
+            d.pop(internal, None)
         for key in ["created_at", "started_at", "completed_at"]:
             if d[key]:
                 d[key + "_str"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d[key]))
@@ -126,6 +134,30 @@ class TaskManager:
                 self._tasks[task_id].progress = progress
                 self._tasks[task_id].progress_msg = msg
 
+    async def set_result(self, task_id: str, result_path: str, result_format: str,
+                         result_duration: float, result_sample_rate: int):
+        async with self._lock:
+            if task_id in self._tasks:
+                task = self._tasks[task_id]
+                task.result_path = result_path
+                task.result_format = result_format
+                task.result_duration = result_duration
+                task.result_sample_rate = result_sample_rate
+
+    def _cleanup_evicted(self):
+        """清理被挤出历史队列的任务的结果文件（在持有锁时调用）"""
+        if len(self._history) >= self._history.maxlen:
+            evicted = self._history[-1]
+            if evicted.result_path:
+                for p in [evicted.result_path,
+                          evicted.result_path.replace(".wav", ".mp3"),
+                          evicted.result_path.replace(".mp3", ".wav")]:
+                    if p and os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+
     async def complete(self, task_id: str):
         async with self._lock:
             if task_id in self._tasks:
@@ -133,8 +165,10 @@ class TaskManager:
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = time.time()
                 task.progress = 1.0
+                task.progress_msg = "完成"
                 if task.started_at:
                     task.duration = task.completed_at - task.started_at
+                self._cleanup_evicted()
                 self._history.appendleft(task)
                 del self._tasks[task_id]
 
@@ -147,6 +181,7 @@ class TaskManager:
                 task.error = error
                 if task.started_at:
                     task.duration = task.completed_at - task.started_at
+                self._cleanup_evicted()
                 self._history.appendleft(task)
                 del self._tasks[task_id]
 
@@ -158,6 +193,22 @@ class TaskManager:
                 if t.id == task_id:
                     return t
             return None
+
+    async def get_queue_position(self, task_id: str) -> int:
+        """返回任务在队列中的位置（1=下一个处理，0=不在队列中）"""
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if not task or task.status != TaskStatus.PENDING:
+                return 0
+            ahead = 0
+            for t in self._tasks.values():
+                if t.id == task_id:
+                    continue
+                if t.status == TaskStatus.PROCESSING:
+                    ahead += 1
+                elif t.status == TaskStatus.PENDING and t.created_at < task.created_at:
+                    ahead += 1
+            return ahead + 1
 
     async def get_status(self) -> dict:
         async with self._lock:
@@ -183,6 +234,92 @@ tts = None
 _inference_semaphore = asyncio.Semaphore(1)
 _queue_depth = 0
 task_manager = TaskManager(max_history=MAX_HISTORY)
+_task_queue: asyncio.Queue = asyncio.Queue()
+_task_params: dict = {}  # task_id -> inference params dict
+
+
+# ── 后台任务处理 Worker ───────────────────────────────────────────────────────
+async def task_worker():
+    """后台 Worker：从队列取任务，逐一推理，存储结果。"""
+    global _queue_depth
+    while True:
+        task_id = await _task_queue.get()
+        params = _task_params.pop(task_id, None)
+        if not params:
+            _task_queue.task_done()
+            continue
+
+        wav_path = params.get("wav_path")
+        try:
+            _queue_depth += 1
+            await task_manager.start(task_id)
+            await task_manager.update_progress(task_id, 0.05, "准备推理...")
+
+            async with _inference_semaphore:
+                await task_manager.update_progress(task_id, 0.1, "GPU 推理中...")
+                loop = asyncio.get_event_loop()
+                try:
+                    infer_kwargs = params["infer_kwargs"]
+                    await loop.run_in_executor(None, lambda: tts.infer(**infer_kwargs))
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        import torch
+                        torch.cuda.empty_cache()
+                        await task_manager.fail(task_id, "GPU 显存不足")
+                        if wav_path and os.path.exists(wav_path):
+                            os.remove(wav_path)
+                        continue
+                    raise
+
+            await task_manager.update_progress(task_id, 0.9, "后处理...")
+
+            duration = get_wav_duration(wav_path)
+            fmt = params.get("output_format", "wav")
+            sample_rate = 22050
+            result_path = wav_path
+
+            if fmt == "mp3":
+                try:
+                    result_path = wav_to_mp3(wav_path)
+                    sample_rate = 44100
+                except Exception:
+                    logger.warning("MP3 conversion failed, returning WAV")
+                    fmt = "wav"
+
+            # 缓存
+            cache_key = params.get("cache_key")
+            if cache_key and ENABLE_CACHE:
+                cache_path = os.path.join(CACHE_DIR, f"{cache_key}.{fmt}")
+                shutil.copy2(result_path, cache_path)
+                dur_path = os.path.join(CACHE_DIR, f"{cache_key}.dur")
+                with open(dur_path, "w") as df:
+                    df.write(str(duration))
+
+            await task_manager.set_result(task_id, result_path, fmt, duration, sample_rate)
+            await task_manager.complete(task_id)
+            logger.info("Task %s completed: %.2fs audio, format=%s", task_id, duration, fmt)
+
+        except Exception as e:
+            logger.error("Task %s failed: %s", task_id, e, exc_info=True)
+            await task_manager.fail(task_id, friendly_error(e))
+            # 失败时清理输出文件
+            if wav_path:
+                for p in [wav_path, wav_path.replace(".wav", ".mp3")]:
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+        finally:
+            _queue_depth -= 1
+            # 清理输入临时文件
+            for p in [params.get("spk_path"), params.get("emo_path")]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            _task_queue.task_done()
 
 
 # ── 生命周期：模型加载 ─────────────────────────────────────────────────────────
@@ -204,7 +341,11 @@ async def lifespan(app: FastAPI):
         logger.info("Model loaded successfully.")
     except Exception as e:
         logger.error("Failed to load model: %s", e)
+    # 启动后台 Worker
+    worker_task = asyncio.create_task(task_worker())
+    logger.info("Background task worker started.")
     yield
+    worker_task.cancel()
     logger.info("Shutting down TTS service.")
 
 
@@ -372,6 +513,9 @@ async def task_sse(task_id: str):
                 yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
                 break
             d = task.to_dict()
+            # 附加队列位置信息
+            if task.status == TaskStatus.PENDING:
+                d["queue_position"] = await task_manager.get_queue_position(task_id)
             if task.progress != last_progress or task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                 yield f"data: {json.dumps(d, ensure_ascii=False)}\n\n"
                 last_progress = task.progress
@@ -380,6 +524,255 @@ async def task_sse(task_id: str):
             await asyncio.sleep(0.5)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ── 异步提交接口 ──────────────────────────────────────────────────────────────
+@app.post("/submit", tags=["语音合成"], summary="异步提交：上传音色合成")
+async def submit_task(
+    text: str = Form(..., description="要合成的文本内容"),
+    spk_audio: UploadFile = File(..., description="音色参考音频文件（WAV，3-10秒）"),
+    emo_audio: UploadFile = File(None, description="情感参考音频文件（可选）"),
+    emo_alpha: float = Form(1.0, ge=0.0, le=1.0, description="情感权重"),
+    use_emo_text: bool = Form(False, description="启用文字驱动情感"),
+    emo_text: str = Form(None, description="情感文字描述"),
+    temperature: float = Form(0.8, ge=0.1, le=2.0),
+    top_p: float = Form(0.8, ge=0.1, le=1.0),
+    top_k: int = Form(30, ge=0, le=200),
+    interval_silence: int = Form(200, ge=0, le=2000),
+    repetition_penalty: float = Form(10.0, ge=1.0, le=20.0),
+    max_text_tokens_per_segment: int = Form(120, ge=20, le=300),
+    output_format: str = Form("wav"),
+    save_voice: str = Form(None, description="保存音色名称"),
+    x_api_key: str = Header(None),
+):
+    """
+    异步提交合成任务，立即返回 task_id 和队列位置。
+
+    通过 `/tasks/{task_id}/sse` 追踪实时进度，完成后通过 `/tasks/{task_id}/result` 下载音频。
+    """
+    verify_key(x_api_key)
+    validate_text(text)
+    if output_format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="output_format 仅支持 'wav' 或 'mp3'")
+    if tts is None:
+        raise HTTPException(status_code=503, detail="模型尚未加载完成，请稍后重试")
+
+    spk_data = await spk_audio.read()
+    if len(spk_data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="音色音频文件超过 50MB 限制")
+    if len(spk_data) < 1000:
+        raise HTTPException(status_code=400, detail="音色音频文件太小，请上传 3-10 秒的有效音频")
+
+    emo_data = None
+    if emo_audio:
+        emo_data = await emo_audio.read()
+
+    task = await task_manager.create(
+        text=text, voice="[uploaded]" + (f" -> {save_voice}" if save_voice else ""),
+        output_format=output_format, temperature=temperature, top_p=top_p, top_k=top_k,
+    )
+
+    spk_path = os.path.join(tempfile.gettempdir(), f"spk_{uuid.uuid4().hex}.wav")
+    with open(spk_path, "wb") as f:
+        f.write(spk_data)
+
+    if save_voice:
+        voice_name = sanitize_voice_name(save_voice)
+        voice_dir = os.path.join(MODEL_DIR, "voices")
+        os.makedirs(voice_dir, exist_ok=True)
+        with open(os.path.join(voice_dir, f"{voice_name}.wav"), "wb") as f:
+            f.write(spk_data)
+        logger.info("Voice saved: %s", voice_name)
+
+    emo_path = None
+    if emo_data:
+        emo_path = os.path.join(tempfile.gettempdir(), f"emo_{uuid.uuid4().hex}.wav")
+        with open(emo_path, "wb") as f:
+            f.write(emo_data)
+
+    wav_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
+    infer_kwargs = {
+        "spk_audio_prompt": spk_path,
+        "text": text,
+        "output_path": wav_path,
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k if top_k > 0 else None,
+        "interval_silence": interval_silence,
+        "repetition_penalty": repetition_penalty,
+        "max_text_tokens_per_segment": max_text_tokens_per_segment,
+    }
+    if use_emo_text:
+        infer_kwargs["use_emo_text"] = True
+        if emo_text:
+            infer_kwargs["emo_text"] = emo_text
+        infer_kwargs["emo_alpha"] = emo_alpha
+    elif emo_path:
+        infer_kwargs["emo_audio_prompt"] = emo_path
+        infer_kwargs["emo_alpha"] = emo_alpha
+
+    _task_params[task.id] = {
+        "infer_kwargs": infer_kwargs,
+        "wav_path": wav_path,
+        "output_format": output_format,
+        "spk_path": spk_path,
+        "emo_path": emo_path,
+    }
+    await _task_queue.put(task.id)
+
+    queue_pos = await task_manager.get_queue_position(task.id)
+    return JSONResponse({
+        "task_id": task.id,
+        "status": "pending",
+        "queue_position": queue_pos,
+        "message": f"任务已提交，当前排队位置：第 {queue_pos} 位",
+    })
+
+
+@app.post("/submit_json", tags=["语音合成"], summary="异步提交：预存音色合成")
+async def submit_task_json(
+    text: str = Form(..., description="要合成的文本内容"),
+    voice_name: str = Form("default", description="预存音色名称"),
+    temperature: float = Form(0.8, ge=0.1, le=2.0),
+    top_p: float = Form(0.8, ge=0.1, le=1.0),
+    top_k: int = Form(30, ge=0, le=200),
+    interval_silence: int = Form(200, ge=0, le=2000),
+    repetition_penalty: float = Form(10.0, ge=1.0, le=20.0),
+    max_text_tokens_per_segment: int = Form(120, ge=20, le=300),
+    use_emo_text: bool = Form(False),
+    emo_text: str = Form(None),
+    emo_alpha: float = Form(1.0, ge=0.0, le=1.0),
+    output_format: str = Form("wav"),
+    x_api_key: str = Header(None),
+):
+    """
+    异步提交预存音色合成任务，立即返回 task_id 和队列位置。
+
+    通过 `/tasks/{task_id}/sse` 追踪进度，`/tasks/{task_id}/result` 下载结果。
+    """
+    verify_key(x_api_key)
+    validate_text(text)
+    if output_format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="output_format 仅支持 'wav' 或 'mp3'")
+    if tts is None:
+        raise HTTPException(status_code=503, detail="模型尚未加载完成，请稍后重试")
+
+    voice_path = safe_voice_path(voice_name)
+    if not os.path.exists(voice_path):
+        raise HTTPException(status_code=404, detail=f"音色 '{voice_name}' 不存在")
+
+    # 检查缓存
+    cache_key = None
+    if ENABLE_CACHE:
+        cache_key = get_cache_key(text, voice_name, temperature, top_p, top_k,
+                                  interval_silence=interval_silence,
+                                  repetition_penalty=repetition_penalty,
+                                  use_emo_text=use_emo_text,
+                                  emo_text=emo_text or "")
+        cache_ext = "mp3" if output_format == "mp3" else "wav"
+        cache_path = os.path.join(CACHE_DIR, f"{cache_key}.{cache_ext}")
+        if os.path.exists(cache_path):
+            logger.info("Cache hit: %s", cache_key)
+            dur_path = os.path.join(CACHE_DIR, f"{cache_key}.dur")
+            duration = 0.0
+            if os.path.exists(dur_path):
+                with open(dur_path) as f:
+                    duration = float(f.read())
+            elif cache_ext == "wav":
+                duration = get_wav_duration(cache_path)
+            # 创建一个已完成的任务直接返回
+            task = await task_manager.create(text=text, voice=voice_name,
+                output_format=output_format, temperature=temperature, top_p=top_p, top_k=top_k)
+            await task_manager.set_result(task.id, cache_path, cache_ext, duration,
+                                          44100 if cache_ext == "mp3" else 22050)
+            await task_manager.complete(task.id)
+            return JSONResponse({
+                "task_id": task.id,
+                "status": "completed",
+                "queue_position": 0,
+                "cached": True,
+                "message": "缓存命中，结果已就绪",
+            })
+
+    task = await task_manager.create(
+        text=text, voice=voice_name,
+        output_format=output_format, temperature=temperature, top_p=top_p, top_k=top_k,
+    )
+
+    wav_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
+    infer_kwargs = {
+        "spk_audio_prompt": voice_path,
+        "text": text,
+        "output_path": wav_path,
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k if top_k > 0 else None,
+        "interval_silence": interval_silence,
+        "repetition_penalty": repetition_penalty,
+        "max_text_tokens_per_segment": max_text_tokens_per_segment,
+    }
+    if use_emo_text:
+        infer_kwargs["use_emo_text"] = True
+        if emo_text:
+            infer_kwargs["emo_text"] = emo_text
+        infer_kwargs["emo_alpha"] = emo_alpha
+
+    _task_params[task.id] = {
+        "infer_kwargs": infer_kwargs,
+        "wav_path": wav_path,
+        "output_format": output_format,
+        "cache_key": cache_key,
+    }
+    await _task_queue.put(task.id)
+
+    queue_pos = await task_manager.get_queue_position(task.id)
+    return JSONResponse({
+        "task_id": task.id,
+        "status": "pending",
+        "queue_position": queue_pos,
+        "message": f"任务已提交，当前排队位置：第 {queue_pos} 位",
+    })
+
+
+@app.get("/tasks/{task_id}/result", tags=["任务管理"], summary="下载任务结果音频")
+async def get_task_result(task_id: str, x_api_key: str = Header(None)):
+    """
+    下载已完成任务的合成音频。
+
+    - 任务完成：返回音频文件
+    - 任务排队/处理中：返回 202 + 当前进度
+    - 任务失败：返回 500 + 错误信息
+    """
+    verify_key(x_api_key)
+    task = await task_manager.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    if task.status == TaskStatus.PENDING:
+        queue_pos = await task_manager.get_queue_position(task_id)
+        return JSONResponse(
+            {"status": "pending", "queue_position": queue_pos,
+             "message": f"排队中（第 {queue_pos} 位）"},
+            status_code=202,
+        )
+    if task.status == TaskStatus.PROCESSING:
+        return JSONResponse(
+            {"status": "processing", "progress": task.progress,
+             "progress_msg": task.progress_msg},
+            status_code=202,
+        )
+    if task.status == TaskStatus.FAILED:
+        raise HTTPException(status_code=500, detail=task.error or "合成失败")
+
+    # COMPLETED
+    if not task.result_path or not os.path.exists(task.result_path):
+        raise HTTPException(status_code=410, detail="结果文件已过期，请重新提交任务")
+
+    media_type = "audio/mpeg" if task.result_format == "mp3" else "audio/wav"
+    filename = f"output.{task.result_format or 'wav'}"
+    return FileResponse(task.result_path, media_type=media_type, filename=filename)
 
 
 # ── 基础合成接口（上传参考音频） ───────────────────────────────────────────────
@@ -428,10 +821,7 @@ async def synthesize(
 
     global _queue_depth
     if _queue_depth >= MAX_QUEUE_DEPTH:
-        raise HTTPException(
-            status_code=429,
-            detail=f"服务繁忙（队列 {_queue_depth}/{MAX_QUEUE_DEPTH}），请稍后重试",
-        )
+        logger.warning("队列较深（%d/%d），任务将排队等待处理", _queue_depth, MAX_QUEUE_DEPTH)
 
     # 先读取和校验上传文件（在创建 task 之前，避免僵尸任务）
     spk_data = await spk_audio.read()
@@ -472,10 +862,10 @@ async def synthesize(
 
     wav_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
 
-    _queue_depth += 1
-    await task_manager.start(task.id)
-    await task_manager.update_progress(task.id, 0.05, "准备推理...")
     try:
+        _queue_depth += 1
+        await task_manager.start(task.id)
+        await task_manager.update_progress(task.id, 0.05, "准备推理...")
         kwargs = {
             "spk_audio_prompt": spk_path,
             "text": text,
@@ -591,10 +981,7 @@ async def synthesize_json(
 
     global _queue_depth
     if _queue_depth >= MAX_QUEUE_DEPTH:
-        raise HTTPException(
-            status_code=429,
-            detail=f"服务繁忙（队列 {_queue_depth}/{MAX_QUEUE_DEPTH}），请稍后重试",
-        )
+        logger.warning("队列较深（%d/%d），任务将排队等待处理", _queue_depth, MAX_QUEUE_DEPTH)
 
     voice_path = safe_voice_path(voice_name)
     if not os.path.exists(voice_path):
@@ -634,10 +1021,10 @@ async def synthesize_json(
 
     wav_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
 
-    _queue_depth += 1
-    await task_manager.start(task.id)
-    await task_manager.update_progress(task.id, 0.05, "准备推理...")
     try:
+        _queue_depth += 1
+        await task_manager.start(task.id)
+        await task_manager.update_progress(task.id, 0.05, "准备推理...")
         infer_kwargs = {
             "spk_audio_prompt": voice_path,
             "text": text,
@@ -743,10 +1130,7 @@ async def synthesize_stream(
 
     global _queue_depth
     if _queue_depth >= MAX_QUEUE_DEPTH:
-        raise HTTPException(
-            status_code=429,
-            detail=f"服务繁忙（队列 {_queue_depth}/{MAX_QUEUE_DEPTH}），请稍后重试",
-        )
+        logger.warning("队列较深（%d/%d），任务将排队等待处理", _queue_depth, MAX_QUEUE_DEPTH)
 
     voice_path = safe_voice_path(voice_name)
     if not os.path.exists(voice_path):
@@ -1728,9 +2112,8 @@ async function synthesize() {
   if (!text) { resultArea.innerHTML = '<div class="msg msg-error">请输入合成文本</div>'; return; }
 
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>合成中...';
   resultArea.innerHTML = '';
-  showProgress(5, '准备中...');
+  const startTime = Date.now();
 
   try {
     const formData = new FormData();
@@ -1742,7 +2125,7 @@ async function synthesize() {
 
     let url;
     if (currentMode === 'upload') {
-      url = '/synthesize';
+      url = '/submit';
       const spkFile = document.getElementById('spkFile').files[0];
       if (!spkFile) { throw new Error('请上传音色参考音频'); }
       formData.append('spk_audio', spkFile);
@@ -1769,7 +2152,7 @@ async function synthesize() {
         if (et) formData.append('emo_text', et);
       }
     } else if (currentMode === 'preset') {
-      url = '/synthesize_json';
+      url = '/submit_json';
       const voice = selectedVoice || document.getElementById('voiceSelect').value;
       if (!voice) { throw new Error('请选择音色'); }
       formData.append('voice_name', voice);
@@ -1787,48 +2170,103 @@ async function synthesize() {
         if (et) formData.append('emo_text', et);
       }
     } else {
+      // 流式模式仍用同步端点
       url = '/synthesize_stream';
       const voice = document.getElementById('streamVoiceSelect').value;
       if (!voice) { throw new Error('请选择音色'); }
       formData.append('voice_name', voice);
+      btn.innerHTML = '<span class="spinner"></span>合成中...';
+      showProgress(5, '推理中...');
+      const resp = await fetch(url, { method: 'POST', body: formData, headers });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || 'HTTP ' + resp.status);
+      }
+      const blob = await resp.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+      const sizeKB = (blob.size / 1024).toFixed(0);
+      showProgress(100, '完成！');
+      setTimeout(hideProgress, 1500);
+      resultArea.innerHTML =
+        '<div class="msg msg-success">合成成功！耗时 ' + elapsed + 's | ' + sizeKB + ' KB</div>' +
+        '<audio controls autoplay src="' + audioUrl + '"></audio>' +
+        '<a href="' + audioUrl + '" download="output.wav" class="btn btn-secondary" style="display:block; text-align:center; margin-top:8px; text-decoration:none;">下载音频（WAV）</a>';
+      btn.disabled = false;
+      btn.textContent = '开始合成';
+      loadTasks();
+      return;
     }
 
-    // 模拟进度（因为实际推理是同步等待 HTTP 响应）
-    let progressTimer = null;
-    let fakeProg = 10;
-    if (currentMode !== 'stream') {
-      progressTimer = setInterval(() => {
-        if (fakeProg < 85) {
-          fakeProg += Math.random() * 5;
-          showProgress(Math.round(fakeProg), 'GPU 推理中...');
+    // ── 异步提交 → SSE 实时进度 → 下载结果 ──
+    btn.innerHTML = '<span class="spinner"></span>提交中...';
+    showProgress(2, '提交任务...');
+
+    const submitResp = await fetch(url, { method: 'POST', body: formData, headers });
+    if (!submitResp.ok) {
+      const err = await submitResp.json().catch(() => ({ detail: submitResp.statusText }));
+      throw new Error(err.detail || 'HTTP ' + submitResp.status);
+    }
+    const submitData = await submitResp.json();
+    const taskId = submitData.task_id;
+
+    // 缓存命中：直接下载结果
+    if (submitData.status === 'completed') {
+      btn.innerHTML = '<span class="spinner"></span>下载中...';
+      showProgress(95, '缓存命中，获取音频...');
+      await downloadAndShowResult(taskId, headers, startTime, resultArea);
+      return;
+    }
+
+    // 排队中：显示队列位置
+    const queuePos = submitData.queue_position || 0;
+    btn.innerHTML = '<span class="spinner"></span>排队中（第 ' + queuePos + ' 位）...';
+    showProgress(3, '排队等待（第 ' + queuePos + ' 位）...');
+
+    // 连接 SSE 追踪实时进度
+    await new Promise((resolve, reject) => {
+      if (sseSource) { sseSource.close(); sseSource = null; }
+      sseSource = new EventSource('/tasks/' + taskId + '/sse');
+
+      sseSource.onmessage = async function(event) {
+        try {
+          const d = JSON.parse(event.data);
+          if (d.status === 'not_found') {
+            sseSource.close(); sseSource = null;
+            reject(new Error('任务丢失'));
+            return;
+          }
+          if (d.status === 'pending') {
+            const pos = d.queue_position || '?';
+            btn.innerHTML = '<span class="spinner"></span>排队中（第 ' + pos + ' 位）...';
+            showProgress(3, '排队等待（第 ' + pos + ' 位）...');
+          } else if (d.status === 'processing') {
+            const pct = Math.round((d.progress || 0) * 100);
+            btn.innerHTML = '<span class="spinner"></span>推理中 ' + pct + '%...';
+            showProgress(pct, d.progress_msg || 'GPU 推理中...');
+          } else if (d.status === 'completed') {
+            sseSource.close(); sseSource = null;
+            showProgress(95, '下载音频...');
+            btn.innerHTML = '<span class="spinner"></span>下载中...';
+            resolve();
+          } else if (d.status === 'failed') {
+            sseSource.close(); sseSource = null;
+            reject(new Error(d.error || '合成失败'));
+          }
+        } catch (e) {
+          sseSource.close(); sseSource = null;
+          reject(e);
         }
-      }, 1000);
-    }
+      };
 
-    const startTime = Date.now();
-    const resp = await fetch(url, { method: 'POST', body: formData, headers });
+      sseSource.onerror = function() {
+        sseSource.close(); sseSource = null;
+        reject(new Error('SSE 连接断开，请检查任务状态'));
+      };
+    });
 
-    if (progressTimer) clearInterval(progressTimer);
-
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-      throw new Error(err.detail || 'HTTP ' + resp.status);
-    }
-
-    showProgress(95, '接收音频...');
-    const blob = await resp.blob();
-    const audioUrl = URL.createObjectURL(blob);
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
-    const fmt = currentMode === 'stream' ? 'wav' : document.getElementById('outputFormat').value;
-    const sizeKB = (blob.size / 1024).toFixed(0);
-
-    showProgress(100, '完成！');
-    setTimeout(hideProgress, 1500);
-
-    resultArea.innerHTML =
-      '<div class="msg msg-success">合成成功！耗时 ' + elapsed + 's | ' + sizeKB + ' KB</div>' +
-      '<audio controls autoplay src="' + audioUrl + '"></audio>' +
-      '<a href="' + audioUrl + '" download="output.' + fmt + '" class="btn btn-secondary" style="display:block; text-align:center; margin-top:8px; text-decoration:none;">下载音频（' + fmt.toUpperCase() + '）</a>';
+    // SSE 报告完成，下载结果
+    await downloadAndShowResult(taskId, headers, startTime, resultArea);
 
     // 如果保存了音色，刷新列表
     if (currentMode === 'upload' && document.getElementById('saveVoiceName').value.trim()) {
@@ -1836,12 +2274,35 @@ async function synthesize() {
     }
   } catch (e) {
     hideProgress();
+    if (sseSource) { sseSource.close(); sseSource = null; }
     resultArea.innerHTML = '<div class="msg msg-error">合成失败: ' + escapeHtml(e.message) + '</div>';
   } finally {
     btn.disabled = false;
     btn.textContent = '开始合成';
     loadTasks();
   }
+}
+
+async function downloadAndShowResult(taskId, headers, startTime, resultArea) {
+  const resp = await fetch('/tasks/' + taskId + '/result', { headers });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(err.detail || '下载失败: HTTP ' + resp.status);
+  }
+  const blob = await resp.blob();
+  const audioUrl = URL.createObjectURL(blob);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+  const contentType = resp.headers.get('content-type') || '';
+  const fmt = contentType.includes('mpeg') ? 'mp3' : 'wav';
+  const sizeKB = (blob.size / 1024).toFixed(0);
+
+  showProgress(100, '完成！');
+  setTimeout(hideProgress, 1500);
+
+  resultArea.innerHTML =
+    '<div class="msg msg-success">合成成功！耗时 ' + elapsed + 's | ' + sizeKB + ' KB</div>' +
+    '<audio controls autoplay src="' + audioUrl + '"></audio>' +
+    '<a href="' + audioUrl + '" download="output.' + fmt + '" class="btn btn-secondary" style="display:block; text-align:center; margin-top:8px; text-decoration:none;">下载音频（' + fmt.toUpperCase() + '）</a>';
 }
 
 // ── 文档标签切换 ────────────────────────────────────
