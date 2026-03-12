@@ -16,7 +16,9 @@ IndexTTS2 FastAPI 服务 v2.1
 """
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -26,14 +28,15 @@ import subprocess
 import tempfile
 import time
 import uuid
+import wave
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, Request
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 # ── 配置（全部从环境变量读取，禁止硬编码） ──────────────────────────────────
@@ -46,6 +49,7 @@ MAX_QUEUE_DEPTH  = int(os.environ.get("MAX_QUEUE_DEPTH", "5"))
 CACHE_DIR        = os.environ.get("CACHE_DIR", "/tmp/tts_cache")
 ENABLE_CACHE     = os.environ.get("ENABLE_CACHE", "true").lower() == "true"
 MAX_HISTORY      = int(os.environ.get("MAX_HISTORY", "100"))
+MAX_TEXT_LENGTH  = int(os.environ.get("MAX_TEXT_LENGTH", "5000"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -231,16 +235,16 @@ app = FastAPI(
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def verify_key(x_api_key: str):
-    if API_KEY and x_api_key != API_KEY:
+    if API_KEY and not hmac.compare_digest(x_api_key or "", API_KEY):
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
 
-async def cleanup_file(path: str, delay: float = 5.0):
-    await asyncio.sleep(delay)
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
+def validate_text(text: str):
+    """校验合成文本：非空、长度不超限"""
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="合成文本不能为空")
+    if len(text) > MAX_TEXT_LENGTH:
+        raise HTTPException(status_code=400, detail=f"文本过长（{len(text)} 字符），最大允许 {MAX_TEXT_LENGTH} 字符")
 
 
 def get_cache_key(text: str, voice_name: str, temperature: float,
@@ -260,10 +264,29 @@ def wav_to_mp3(wav_path: str, bitrate: str = "128k") -> str:
     return mp3_path
 
 
+def get_wav_duration(path: str) -> float:
+    """获取 WAV 文件时长（秒），保留两位小数"""
+    with wave.open(path, "rb") as f:
+        return round(f.getnframes() / f.getframerate(), 2)
+
+
 def sanitize_voice_name(name: str) -> str:
     """只允许字母、数字、中文、下划线、连字符"""
     name = re.sub(r'[^\w\u4e00-\u9fff-]', '_', name)
     return name[:50]
+
+
+def safe_voice_path(voice_name: str) -> str:
+    """构造音色文件路径，防止路径穿越攻击。
+    拒绝包含 .. / \\ 等路径分隔符的名称。"""
+    if not voice_name or ".." in voice_name or "/" in voice_name or "\\" in voice_name:
+        raise HTTPException(status_code=400, detail="音色名称包含非法字符")
+    # 二次过滤：确保最终路径仍在 voices 目录内
+    voice_dir = os.path.join(MODEL_DIR, "voices")
+    full_path = os.path.normpath(os.path.join(voice_dir, f"{voice_name}.wav"))
+    if not full_path.startswith(os.path.normpath(voice_dir)):
+        raise HTTPException(status_code=400, detail="音色名称包含非法字符")
+    return full_path
 
 
 def friendly_error(e: Exception) -> str:
@@ -295,7 +318,7 @@ async def health():
         "status": "ok",
         "model_loaded": True,
         "queue_depth": _queue_depth,
-        "queue_capacity": MAX_QUEUE_DEPTH,
+        "queue_max": MAX_QUEUE_DEPTH,
         "fp16": USE_FP16,
         "cache_enabled": ENABLE_CACHE,
     }
@@ -338,7 +361,10 @@ async def task_sse(task_id: str):
 
     async def event_stream():
         last_progress = -1.0
-        while True:
+        max_polls = 600  # 最多轮询 600 次 × 0.5s = 5 分钟
+        polls = 0
+        while polls < max_polls:
+            polls += 1
             task = await task_manager.get_task(task_id)
             if not task:
                 yield f"data: {json.dumps({'status': 'not_found'})}\n\n"
@@ -363,6 +389,7 @@ async def synthesize(
     emo_alpha: float = Form(1.0, ge=0.0, le=1.0, description="情感权重，0.0=无情感，1.0=完全情感"),
     use_emo_text: bool = Form(False, description="启用文字驱动情感（通过 QwenEmotion 模型从文字生成情感向量）"),
     emo_text: str = Form(None, description="情感文字描述（use_emo_text=true 时生效，留空则用合成文本本身）"),
+    speech_speed: float = Form(1.0, ge=0.5, le=2.0, description="语速。1.0=正常，0.5=最慢，2.0=最快"),
     temperature: float = Form(0.8, ge=0.1, le=2.0, description="采样温度，越高越随机多样"),
     top_p: float = Form(0.8, ge=0.1, le=1.0, description="Top-P 核采样，控制采样范围"),
     top_k: int = Form(30, ge=0, le=200, description="Top-K 采样，0=不限制"),
@@ -389,6 +416,10 @@ async def synthesize(
     - `save_voice`：传入名称则将上传的音频保存为预存音色
     """
     verify_key(x_api_key)
+    validate_text(text)
+
+    if output_format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="output_format 仅支持 'wav' 或 'mp3'")
 
     if tts is None:
         raise HTTPException(status_code=503, detail="模型尚未加载完成，请稍后重试")
@@ -400,13 +431,25 @@ async def synthesize(
             detail=f"服务繁忙（队列 {_queue_depth}/{MAX_QUEUE_DEPTH}），请稍后重试",
         )
 
+    # 先读取和校验上传文件（在创建 task 之前，避免僵尸任务）
+    spk_data = await spk_audio.read()
+    if len(spk_data) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="音色音频文件超过 50MB 限制")
+    if len(spk_data) < 1000:
+        raise HTTPException(status_code=400, detail="音色音频文件太小，请上传 3-10 秒的有效音频")
+
+    emo_data = None
+    if emo_audio:
+        emo_data = await emo_audio.read()
+        if len(emo_data) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="情感音频文件超过 50MB 限制")
+
     task = await task_manager.create(
         text=text, voice="[uploaded]" + (f" -> {save_voice}" if save_voice else ""),
         output_format=output_format, temperature=temperature, top_p=top_p, top_k=top_k,
     )
 
     spk_path = os.path.join(tempfile.gettempdir(), f"spk_{uuid.uuid4().hex}.wav")
-    spk_data = await spk_audio.read()
     with open(spk_path, "wb") as f:
         f.write(spk_data)
 
@@ -420,12 +463,12 @@ async def synthesize(
         logger.info("Voice saved: %s", voice_name)
 
     emo_path = None
-    if emo_audio:
+    if emo_data:
         emo_path = os.path.join(tempfile.gettempdir(), f"emo_{uuid.uuid4().hex}.wav")
         with open(emo_path, "wb") as f:
-            f.write(await emo_audio.read())
+            f.write(emo_data)
 
-    output_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
+    wav_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
 
     _queue_depth += 1
     await task_manager.start(task.id)
@@ -434,7 +477,7 @@ async def synthesize(
         kwargs = {
             "spk_audio_prompt": spk_path,
             "text": text,
-            "output_path": output_path,
+            "output_path": wav_path,
             "do_sample": True,
             "temperature": temperature,
             "top_p": top_p,
@@ -442,11 +485,13 @@ async def synthesize(
             "interval_silence": interval_silence,
             "repetition_penalty": repetition_penalty,
             "max_text_tokens_per_segment": max_text_tokens_per_segment,
+            "speech_speed": speech_speed,
         }
         if use_emo_text:
             kwargs["use_emo_text"] = True
             if emo_text:
                 kwargs["emo_text"] = emo_text
+            kwargs["emo_alpha"] = emo_alpha
         elif emo_path:
             kwargs["emo_audio_prompt"] = emo_path
             kwargs["emo_alpha"] = emo_alpha
@@ -466,20 +511,31 @@ async def synthesize(
 
         await task_manager.update_progress(task.id, 0.9, "后处理...")
 
+        # duration 必须在 WAV 阶段计算（MP3 转码后 wave 模块无法读取）
+        duration = get_wav_duration(wav_path)
+        fmt = output_format
+        sample_rate = 22050
+
+        result_path = wav_path
         if output_format == "mp3":
             try:
-                output_path = wav_to_mp3(output_path)
-                media_type, filename = "audio/mpeg", "synthesized.mp3"
+                result_path = wav_to_mp3(wav_path)
+                fmt = "mp3"
+                sample_rate = 44100
             except Exception:
                 logger.warning("MP3 conversion failed, returning WAV")
-                media_type, filename = "audio/wav", "synthesized.wav"
-        else:
-            media_type, filename = "audio/wav", "synthesized.wav"
+                fmt = "wav"
 
+        with open(result_path, "rb") as f:
+            audio_bytes = f.read()
         await task_manager.complete(task.id)
-        response = FileResponse(output_path, media_type=media_type, filename=filename)
-        asyncio.create_task(cleanup_file(output_path))
-        return response
+
+        return JSONResponse({
+            "audio_base64": base64.b64encode(audio_bytes).decode(),
+            "duration": duration,
+            "format": fmt,
+            "sample_rate": sample_rate,
+        })
 
     except HTTPException:
         raise
@@ -492,6 +548,10 @@ async def synthesize(
         for p in [spk_path, emo_path]:
             if p and os.path.exists(p):
                 os.remove(p)
+        # 清理输出文件（WAV 和可能的 MP3）
+        for p in [wav_path, wav_path.replace(".wav", ".mp3")]:
+            if os.path.exists(p):
+                os.remove(p)
 
 
 # ── 预存音色合成接口 ─────────────────────────────────────────────────────────
@@ -499,6 +559,7 @@ async def synthesize(
 async def synthesize_json(
     text: str = Form(..., description="要合成的文本内容", examples=["你好，欢迎使用语音合成服务"]),
     voice_name: str = Form("default", description="预存音色名称（对应 voices/ 目录下的文件名）"),
+    speech_speed: float = Form(1.0, ge=0.5, le=2.0, description="语速。1.0=正常，0.5=最慢，2.0=最快"),
     temperature: float = Form(0.8, ge=0.1, le=2.0, description="采样温度"),
     top_p: float = Form(0.8, ge=0.1, le=1.0, description="Top-P 核采样"),
     top_k: int = Form(30, ge=0, le=200, description="Top-K 采样，0=不限制"),
@@ -507,6 +568,7 @@ async def synthesize_json(
     max_text_tokens_per_segment: int = Form(120, ge=20, le=300, description="每段最大 token 数"),
     use_emo_text: bool = Form(False, description="启用文字驱动情感"),
     emo_text: str = Form(None, description="情感文字描述"),
+    emo_alpha: float = Form(1.0, ge=0.0, le=1.0, description="情感强度 0.0-1.0"),
     output_format: str = Form("wav", description="输出格式：wav 或 mp3"),
     x_api_key: str = Header(None),
 ):
@@ -518,6 +580,10 @@ async def synthesize_json(
     先通过 `/voices` 查看可用音色列表，再传入 `voice_name`。
     """
     verify_key(x_api_key)
+    validate_text(text)
+
+    if output_format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="output_format 仅支持 'wav' 或 'mp3'")
 
     if tts is None:
         raise HTTPException(status_code=503, detail="模型尚未加载完成，请稍后重试")
@@ -529,27 +595,44 @@ async def synthesize_json(
             detail=f"服务繁忙（队列 {_queue_depth}/{MAX_QUEUE_DEPTH}），请稍后重试",
         )
 
-    voice_path = os.path.join(MODEL_DIR, "voices", f"{voice_name}.wav")
+    voice_path = safe_voice_path(voice_name)
     if not os.path.exists(voice_path):
         raise HTTPException(status_code=404, detail=f"音色 '{voice_name}' 不存在，请先通过 /voices 查看可用音色或上传新音色")
 
     if ENABLE_CACHE:
         cache_key = get_cache_key(text, voice_name, temperature, top_p, top_k,
                                   interval_silence=interval_silence,
-                                  repetition_penalty=repetition_penalty)
+                                  repetition_penalty=repetition_penalty,
+                                  speech_speed=speech_speed,
+                                  use_emo_text=use_emo_text,
+                                  emo_text=emo_text or "")
         cache_ext = "mp3" if output_format == "mp3" else "wav"
         cache_path = os.path.join(CACHE_DIR, f"{cache_key}.{cache_ext}")
         if os.path.exists(cache_path):
             logger.info("Cache hit: %s", cache_key)
-            media_type = "audio/mpeg" if output_format == "mp3" else "audio/wav"
-            return FileResponse(cache_path, media_type=media_type, filename=f"output.{cache_ext}")
+            with open(cache_path, "rb") as f:
+                audio_bytes = f.read()
+            # 缓存的 WAV 文件读 duration；MP3 则从同名 .dur 文件读取
+            dur_path = os.path.join(CACHE_DIR, f"{cache_key}.dur")
+            if os.path.exists(dur_path):
+                with open(dur_path) as f:
+                    duration = float(f.read())
+            else:
+                duration = get_wav_duration(cache_path) if cache_ext == "wav" else 0.0
+            sample_rate = 44100 if cache_ext == "mp3" else 22050
+            return JSONResponse({
+                "audio_base64": base64.b64encode(audio_bytes).decode(),
+                "duration": duration,
+                "format": cache_ext,
+                "sample_rate": sample_rate,
+            })
 
     task = await task_manager.create(
         text=text, voice=voice_name,
         output_format=output_format, temperature=temperature, top_p=top_p, top_k=top_k,
     )
 
-    output_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
+    wav_path = os.path.join(tempfile.gettempdir(), f"out_{uuid.uuid4().hex}.wav")
 
     _queue_depth += 1
     await task_manager.start(task.id)
@@ -558,7 +641,7 @@ async def synthesize_json(
         infer_kwargs = {
             "spk_audio_prompt": voice_path,
             "text": text,
-            "output_path": output_path,
+            "output_path": wav_path,
             "do_sample": True,
             "temperature": temperature,
             "top_p": top_p,
@@ -566,11 +649,13 @@ async def synthesize_json(
             "interval_silence": interval_silence,
             "repetition_penalty": repetition_penalty,
             "max_text_tokens_per_segment": max_text_tokens_per_segment,
+            "speech_speed": speech_speed,
         }
         if use_emo_text:
             infer_kwargs["use_emo_text"] = True
             if emo_text:
                 infer_kwargs["emo_text"] = emo_text
+            infer_kwargs["emo_alpha"] = emo_alpha
 
         async with _inference_semaphore:
             await task_manager.update_progress(task.id, 0.1, "GPU 推理中...")
@@ -587,24 +672,39 @@ async def synthesize_json(
 
         await task_manager.update_progress(task.id, 0.9, "后处理...")
 
+        # duration 必须在 WAV 阶段计算
+        duration = get_wav_duration(wav_path)
+        fmt = output_format
+        sample_rate = 22050
+
+        result_path = wav_path
         if output_format == "mp3":
             try:
-                output_path = wav_to_mp3(output_path)
-                media_type, filename, ext = "audio/mpeg", "output.mp3", "mp3"
+                result_path = wav_to_mp3(wav_path)
+                fmt = "mp3"
+                sample_rate = 44100
             except Exception:
                 logger.warning("MP3 conversion failed, returning WAV")
-                media_type, filename, ext = "audio/wav", "output.wav", "wav"
-        else:
-            media_type, filename, ext = "audio/wav", "output.wav", "wav"
+                fmt = "wav"
 
         if ENABLE_CACHE:
-            cache_path = os.path.join(CACHE_DIR, f"{cache_key}.{ext}")
-            shutil.copy2(output_path, cache_path)
+            cache_path = os.path.join(CACHE_DIR, f"{cache_key}.{fmt}")
+            shutil.copy2(result_path, cache_path)
+            # 保存 duration 供缓存命中时读取
+            dur_path = os.path.join(CACHE_DIR, f"{cache_key}.dur")
+            with open(dur_path, "w") as df:
+                df.write(str(duration))
 
+        with open(result_path, "rb") as f:
+            audio_bytes = f.read()
         await task_manager.complete(task.id)
-        response = FileResponse(output_path, media_type=media_type, filename=filename)
-        asyncio.create_task(cleanup_file(output_path))
-        return response
+
+        return JSONResponse({
+            "audio_base64": base64.b64encode(audio_bytes).decode(),
+            "duration": duration,
+            "format": fmt,
+            "sample_rate": sample_rate,
+        })
 
     except HTTPException:
         raise
@@ -614,6 +714,10 @@ async def synthesize_json(
         raise HTTPException(status_code=500, detail=friendly_error(e))
     finally:
         _queue_depth -= 1
+        # 清理输出文件（WAV 和可能的 MP3）
+        for p in [wav_path, wav_path.replace(".wav", ".mp3")]:
+            if os.path.exists(p):
+                os.remove(p)
 
 
 # ── 流式合成接口 ────────────────────────────────────────────────────────────
@@ -621,39 +725,77 @@ async def synthesize_json(
 async def synthesize_stream(
     text: str = Form(..., description="要合成的文本内容"),
     voice_name: str = Form("default", description="预存音色名称"),
+    speech_speed: float = Form(1.0, ge=0.5, le=2.0, description="语速。1.0=正常，0.5=最慢，2.0=最快"),
+    use_emo_text: bool = Form(False, description="启用文字驱动情感"),
+    emo_text: str = Form(None, description="情感文字描述"),
+    emo_alpha: float = Form(1.0, ge=0.0, le=1.0, description="情感强度 0.0-1.0"),
     x_api_key: str = Header(None),
 ):
     """
     流式语音合成，逐句输出音频数据，降低首包延迟。
 
-    **注意**：流式模式不支持高级参数调节和缓存。
+    支持语速和情感参数，与非流式接口行为一致。
     """
     verify_key(x_api_key)
+    validate_text(text)
 
     if tts is None:
         raise HTTPException(status_code=503, detail="模型尚未加载完成，请稍后重试")
 
-    voice_path = os.path.join(MODEL_DIR, "voices", f"{voice_name}.wav")
+    global _queue_depth
+    if _queue_depth >= MAX_QUEUE_DEPTH:
+        raise HTTPException(
+            status_code=429,
+            detail=f"服务繁忙（队列 {_queue_depth}/{MAX_QUEUE_DEPTH}），请稍后重试",
+        )
+
+    voice_path = safe_voice_path(voice_name)
     if not os.path.exists(voice_path):
         raise HTTPException(status_code=404, detail=f"音色 '{voice_name}' 不存在")
 
+    stream_output_path = os.path.join(tempfile.gettempdir(), f"stream_{uuid.uuid4().hex}.wav")
+    infer_kwargs = {
+        "spk_audio_prompt": voice_path,
+        "text": text,
+        "output_path": stream_output_path,
+        "stream_return": True,
+        "speech_speed": speech_speed,
+    }
+    if use_emo_text:
+        infer_kwargs["use_emo_text"] = True
+        if emo_text:
+            infer_kwargs["emo_text"] = emo_text
+        infer_kwargs["emo_alpha"] = emo_alpha
+
     async def generate():
-        async with _inference_semaphore:
-            loop = asyncio.get_event_loop()
-            try:
-                chunks = await loop.run_in_executor(
-                    None,
-                    lambda: list(tts.infer(
-                        spk_audio_prompt=voice_path, text=text,
-                        output_path=os.path.join(tempfile.gettempdir(), f"stream_{uuid.uuid4().hex}.wav"),
-                        stream_return=True,
-                    )),
-                )
-                for chunk in chunks:
-                    yield chunk
-            except Exception as e:
-                logger.error("Stream synthesis failed: %s", e)
-                return
+        global _queue_depth
+        _queue_depth += 1
+        try:
+            async with _inference_semaphore:
+                loop = asyncio.get_event_loop()
+                try:
+                    chunks = await loop.run_in_executor(
+                        None,
+                        lambda: list(tts.infer(**infer_kwargs)),
+                    )
+                    for chunk in chunks:
+                        yield chunk
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        import torch
+                        torch.cuda.empty_cache()
+                        logger.error("Stream OOM: %s", e)
+                    else:
+                        logger.error("Stream synthesis failed: %s", e)
+                    return
+                except Exception as e:
+                    logger.error("Stream synthesis failed: %s", e)
+                    return
+        finally:
+            _queue_depth -= 1
+            # 清理流式输出临时文件
+            if os.path.exists(stream_output_path):
+                os.remove(stream_output_path)
 
     return StreamingResponse(generate(), media_type="audio/wav")
 
@@ -707,14 +849,19 @@ async def upload_voice(
         f.write(data)
 
     logger.info("Voice uploaded: %s (%d KB)", name, len(data) // 1024)
-    return {"message": f"音色 '{name}' 保存成功", "voice_name": name, "size_kb": round(len(data) / 1024, 1)}
+    return JSONResponse({
+        "voice_name": name,
+        "status": "ready",
+        "file_size": os.path.getsize(dest),
+        "message": "音色上传成功，可立即使用",
+    })
 
 
 @app.delete("/voices/{voice_name}", tags=["音色管理"], summary="删除预存音色")
 async def delete_voice(voice_name: str, x_api_key: str = Header(None)):
     """删除指定的预存音色。"""
     verify_key(x_api_key)
-    voice_path = os.path.join(MODEL_DIR, "voices", f"{voice_name}.wav")
+    voice_path = safe_voice_path(voice_name)
     if not os.path.exists(voice_path):
         raise HTTPException(status_code=404, detail=f"音色 '{voice_name}' 不存在")
     os.remove(voice_path)
@@ -725,7 +872,7 @@ async def delete_voice(voice_name: str, x_api_key: str = Header(None)):
 @app.get("/voices/{voice_name}/preview", tags=["音色管理"], summary="试听预存音色")
 async def preview_voice(voice_name: str):
     """返回预存音色的原始参考音频，用于试听。（无需认证）"""
-    voice_path = os.path.join(MODEL_DIR, "voices", f"{voice_name}.wav")
+    voice_path = safe_voice_path(voice_name)
     if not os.path.exists(voice_path):
         raise HTTPException(status_code=404, detail=f"音色 '{voice_name}' 不存在")
     return FileResponse(voice_path, media_type="audio/wav", filename=f"{voice_name}.wav")
@@ -1296,6 +1443,12 @@ function toggleEmoText() {
 }
 
 // ── 滑块 ────────────────────────────────────────────
+function escapeHtml(s) {
+  var d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 function updateSlider(el) {
   document.getElementById(el.id + 'Val').textContent = el.value;
 }
@@ -1354,7 +1507,7 @@ function onFileSelect(fileId, dropId, previewId) {
     const sizeMB = (file.size / 1024 / 1024).toFixed(1);
     drop.classList.add('has-file');
     const label = document.getElementById(labelId);
-    label.innerHTML = '<span class="file-info"><span class="file-name">' + file.name + '</span> (' + sizeMB + 'MB) <span class="file-clear" id="clear_' + fileId + '">清除</span></span>';
+    label.innerHTML = '<span class="file-info"><span class="file-name">' + escapeHtml(file.name) + '</span> (' + sizeMB + 'MB) <span class="file-clear" id="clear_' + fileId + '">清除</span></span>';
     document.getElementById('clear_' + fileId).addEventListener('click', function(e) {
       e.stopPropagation();
       clearFile(fileId, dropId, previewId);
@@ -1382,7 +1535,7 @@ async function checkHealth() {
     const data = await resp.json();
     const badge = document.getElementById('statusBadge');
     if (data.model_loaded) {
-      badge.textContent = 'GPU ' + (data.fp16 ? 'FP16' : 'FP32') + ' | ' + data.queue_depth + '/' + data.queue_capacity + ' 队列';
+      badge.textContent = 'GPU ' + (data.fp16 ? 'FP16' : 'FP32') + ' | ' + data.queue_depth + '/' + data.queue_max + ' 队列';
       badge.className = 'status-badge status-ok';
     } else {
       badge.textContent = '模型加载中...';
@@ -1434,7 +1587,7 @@ async function loadVoiceGrid() {
 
     // 同步到下拉框
     const sel = document.getElementById('voiceSelect');
-    sel.innerHTML = data.voices.map(v => '<option value="' + v + '">' + v + '</option>').join('');
+    sel.innerHTML = data.voices.map(v => '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>').join('');
     if (selectedVoice) sel.value = selectedVoice;
   } catch (e) {}
 }
@@ -1508,7 +1661,7 @@ async function loadVoices(selectId) {
     if (data.voices.length === 0) {
       sel.innerHTML = '<option value="">未找到预存音色</option>';
     } else {
-      data.voices.forEach(v => { sel.innerHTML += '<option value="' + v + '">' + v + '</option>'; });
+      data.voices.forEach(v => { sel.innerHTML += '<option value="' + escapeHtml(v) + '">' + escapeHtml(v) + '</option>'; });
     }
   } catch (e) {}
 }
@@ -1685,7 +1838,7 @@ async function synthesize() {
     }
   } catch (e) {
     hideProgress();
-    resultArea.innerHTML = '<div class="msg msg-error">合成失败: ' + e.message + '</div>';
+    resultArea.innerHTML = '<div class="msg msg-error">合成失败: ' + escapeHtml(e.message) + '</div>';
   } finally {
     btn.disabled = false;
     btn.textContent = '开始合成';
