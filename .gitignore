@@ -1,0 +1,46 @@
+# ── 敏感配置 ──
+.env
+
+# ── 模型权重（体积太大） ──
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
+
+# ── 上游源码（单独管理） ──
+indextts-src/
+
+# ── 日志与临时文件 ──
+logs/
+*.wav
+*.mp3
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ── Docker ──
+.docker/
+
+# ── IDE / 编辑器 ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Claude Code ──
+.claude/
+
+# ── 系统 / 杂项 ──
+*.tmp
+Thumbs.db
+.DS_Store

@@ -1,0 +1,64 @@
+# IndexTTS2 服务编排
+# 使用方式：
+#   1. 复制 .env.example 为 .env 并填写配置
+#   2. 确保 checkpoints/ 目录已下载模型权重
+#   3. docker compose up -d --build
+
+services:
+  tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: indextts2-api
+    restart: always
+
+    # GPU 配置：使用第一张 GPU（RTX 3080 Ti）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # 模型权重：放在 WSL2 原生文件系统（性能好），路径通过环境变量覆盖
+      # 默认路径 ~/tts-checkpoints，可在 .env 中用 CHECKPOINTS_HOST_PATH 修改
+      - ${CHECKPOINTS_HOST_PATH:-/root/tts-checkpoints}:/app/checkpoints
+      # 音色缓存（可选，跨容器重启保留缓存）
+      - tts_cache:/tmp/tts_cache
+      # 日志目录（软链接后此路径在 Windows VS Code 中可见）
+      - ./logs:/app/logs
+
+    env_file:
+      - .env
+
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - MODEL_DIR=/app/checkpoints
+      - CACHE_DIR=/tmp/tts_cache
+      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HOME=/app/checkpoints/hf_cache
+      - PYTHONUNBUFFERED=1
+
+    # 健康检查（模型加载最多需要 90s）
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+    # 日志轮转（防止日志占满磁盘）
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  tts_cache:
+    driver: local
